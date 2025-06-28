@@ -9,9 +9,6 @@ from sklearn.metrics import confusion_matrix, classification_report
 
 from torch.nn import Sequential, Linear, ReLU
 
-# from torch_geometric.nn import MessagePassing, DynamicEdgeConv, GATConv
-# from torch_cluster import knn_graph
-
 from .utils.misc import (NestedTensor, nested_tensor_from_tensor_list,
                        accuracy, get_world_size, interpolate,
                        is_dist_avail_and_initialized)
@@ -96,7 +93,7 @@ class GarmentDETRv6(nn.Module):
         edge_query = self.edge_query_mlp(torch.cat((panel_joint_hs[-1, :, :self.num_panel_queries, :].unsqueeze(2).expand(-1, -1, self.num_edges, -1), edge_output), dim=-1)).reshape(B, -1, self.hidden_dim).permute(1, 0, 2)
 
         tgt = torch.zeros_like(edge_query)
-        memory = panel_memory.view(B, self.hidden_dim, -1).permute(2, 0, 1)         # latten NxCxHxW to HWxNxC
+        memory = panel_memory.view(B, self.hidden_dim, -1).permute(2, 0, 1)
         edge_hs = self.edge_trans_decoder(tgt, memory, 
                                           memory_key_padding_mask=mask.flatten(1), 
                                           query_pos=edge_query).transpose(1, 2)
@@ -106,49 +103,31 @@ class GarmentDETRv6(nn.Module):
         output_edge_cls = self.edge_cls(output_edge_embed)
         output_edges = self.edge_decoder(output_edge_embed) + edge_output.view(B, -1, 4)
 
-
         out.update({"outlines": output_edges, "edge_cls": output_edge_cls})
 
-        if return_stitches:
-            pred_edge_prob = torch.sigmoid(output_edge_cls.squeeze(-1))
+        if gt_stitches is not None and gt_edge_mask is not None:
+            # Reshape gt_stitches and gt_edge_mask to be 2D
+            gt_stitches = gt_stitches.view(B, -1)
+            gt_edge_mask = gt_edge_mask.view(B, -1)
+            
+            # Ensure gather indices are within the bounds of output_edge_embed
+            max_index = output_edge_embed.shape[1]
+            gt_stitches = gt_stitches.clamp(max=max_index - 1)
 
-            if "max_num_edges" in self.edge_kwargs:
-                num_edges = self.edge_kwargs["max_num_edges"]
-            else:
-                num_edges = (pred_edge_prob > 0.5).sum(dim=1).max().item()
-                num_edges = num_edges + 1 if num_edges % 2 != 0 else num_edges
+            gather_indices = gt_stitches.unsqueeze(-1).expand(-1, -1, output_edge_embed.shape[-1])
+            edge_node_features = torch.gather(output_edge_embed, 1, gather_indices.long())
             
-            stitch_edges = torch.argsort(pred_edge_prob, dim=1)[:, :num_edges]
-            # use_gt = random.random() < self.edge_kwargs["gt_prob"] if "gt_prob" in self.edge_kwargs else False
-            
-            if gt_stitches is not None:
-                stitch_edges = gt_stitches
-            
-            # Squeeze trailing dimensions of size 1 to make tensor shape consistent
-            while stitch_edges.dim() > 2 and stitch_edges.shape[-1] == 1:
-                stitch_edges = stitch_edges.squeeze(-1)
-
-            # unsqueeze to add feature dimension for broadcasting and expand
-            indices_for_gather = stitch_edges.unsqueeze(-1)
-            # Create the target shape for expansion
-            expand_dims = list(indices_for_gather.shape)
-            expand_dims[-1] = output_edge_embed.shape[-1]
-            gather_indices = indices_for_gather.expand(*expand_dims).long()
-            
-            edge_node_features = torch.gather(output_edge_embed, 1, gather_indices)
-
-            if gt_stitches is not None and gt_edge_mask is not None:
-                mask_expanded = gt_edge_mask.unsqueeze(-1).expand_as(edge_node_features)
-                edge_node_features = edge_node_features.masked_fill(mask_expanded == 0, 0)
-            
-            reindex_stitches = None
+            mask_for_fill = gt_edge_mask.unsqueeze(-1).expand_as(edge_node_features) == 0
+            edge_node_features = edge_node_features.masked_fill(mask_for_fill, 0)
         else:
             edge_node_features = output_edge_embed
         
         edge_norm_features = F.normalize(edge_node_features, dim=-1)
         edge_similarity = torch.bmm(edge_norm_features, edge_norm_features.transpose(1, 2))
-        mask = torch.eye(edge_similarity.shape[1]).repeat(edge_similarity.shape[0], 1, 1).bool()
-        edge_similarity[mask] = 0
+        
+        # Mask out diagonal
+        mask = torch.eye(edge_similarity.shape[1], device=edge_similarity.device).repeat(edge_similarity.shape[0], 1, 1).bool()
+        edge_similarity[mask] = -float("inf")
         out.update({"edge_similarity": edge_similarity})
         
         return out
@@ -167,31 +146,43 @@ class MLP(nn.Module):
             x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
         return x
 
-class StitchLoss():
-    def __init__(self):
-        super().__init__()
-        self.loss = nn.BCEWithLogitsLoss()
-
-    def __call__(self, similarity_matrix, gt_pos_neg_indices):
-        simi_matrix = similarity_matrix.reshape(-1, similarity_matrix.shape[-1])
-        tmp = simi_matrix[gt_pos_neg_indices[:, :, 0]]
-        simi_res = torch.gather(tmp, -1, gt_pos_neg_indices[:, :, 1].unsqueeze(-1)) / 0.01
-        ce_label = torch.zeros(simi_res.shape[0]).to(simi_res.device)
-        return F.cross_entropy(simi_res.squeeze(-1), ce_label.long()), (torch.max(simi_res.squeeze(-1), 1)[1] == 0).sum() * 1.0 / simi_res.shape[0]
-
-class StitchSimpleLoss():
+class StitchLoss(nn.Module):
+    """
+    Robust binary cross-entropy loss for stitch similarity matrix.
+    Handles shape mismatches between model output and ground truth.
+    """
     def __call__(self, similarity_matrix, gt_matrix, gt_free_mask=None):
+        num_queries = similarity_matrix.shape[1]
+        
+        # Slice ground truth adjacency matrix to match query dimension
+        if gt_matrix.shape[1] > num_queries:
+            gt_matrix = gt_matrix[:, :num_queries, :num_queries]
+
         if gt_free_mask is not None:
-            gt_free_mask = gt_free_mask.reshape(gt_free_mask.shape[0], -1)
+            # Ensure gt_free_mask is 2D (batch_size, num_edges)
+            if gt_free_mask.dim() > 2:
+                gt_free_mask = gt_free_mask.reshape(gt_free_mask.shape[0], -1)
+
+            batch_size, num_edges = gt_free_mask.shape
+            
+            # Pad or slice the mask to match the number of queries
+            if num_edges != num_queries:
+                if num_edges < num_queries:
+                    # Padded edges are considered "free", so pad with True
+                    padding = torch.ones(batch_size, num_queries - num_edges, dtype=torch.bool, device=gt_free_mask.device)
+                    gt_free_mask = torch.cat([gt_free_mask, padding], dim=1)
+                else: # num_edges > num_queries
+                    gt_free_mask = gt_free_mask[:, :num_queries]
+
+            # Apply mask to both rows and columns of the similarity matrix
             similarity_matrix = torch.masked_fill(similarity_matrix, gt_free_mask.unsqueeze(1), -float("inf"))
-            similarity_matrix = torch.masked_fill(similarity_matrix, gt_free_mask.unsqueeze(-1), 0)
+            similarity_matrix = torch.masked_fill(similarity_matrix, gt_free_mask.unsqueeze(2), -float("inf"))
 
-        simi_matrix = (similarity_matrix / 0.01).reshape(-1, similarity_matrix.shape[-1])
-        gt = gt_matrix.reshape(-1, gt_matrix.shape[-1])
-        gt_labels = torch.argmax(gt, dim=1).long()
-        return F.nll_loss(F.log_softmax(simi_matrix, dim=-1), gt_labels), (torch.argmax(simi_matrix, dim=1) == gt_labels).sum() / simi_matrix.shape[0]
-
-
+        gt_matrix = gt_matrix.float()
+        loss = F.binary_cross_entropy_with_logits(similarity_matrix, gt_matrix)
+        
+        accuracy = ((F.sigmoid(similarity_matrix) > 0.5) == gt_matrix).sum().float() / gt_matrix.numel()
+        return loss, accuracy
 
 class SetCriterionWithOutMatcher(nn.Module):
 
@@ -199,13 +190,13 @@ class SetCriterionWithOutMatcher(nn.Module):
         super().__init__()
         self.config = {}
         self.config['loss'] = {
-            'loss_components': ['shape', 'loop', 'rotation', 'translation'],  # , 'stitch', 'free_class'],
-            'quality_components': ['shape', 'discrete', 'rotation', 'translation'],  #, 'stitch', 'free_class'],
+            'loss_components': ['shape', 'loop', 'rotation', 'translation'],
+            'quality_components': ['shape', 'discrete', 'rotation', 'translation'],
             'panel_origin_invariant_loss': False,
             'loop_loss_weight': 1.,
             'stitch_tags_margin': 0.3,
             'epoch_with_stitches': 10000, 
-            'stitch_supervised_weight': 0.1,   # only used when explicit stitch loss is used
+            'stitch_supervised_weight': 0.1,
             'stitch_hardnet_version': False,
             'panel_origin_invariant_loss': True
         }
@@ -213,10 +204,7 @@ class SetCriterionWithOutMatcher(nn.Module):
         self.config['loss'].update(in_config)
 
         self.composed_loss = ComposedPatternLoss(data_config, self.config['loss'])
-
-        self.stitch_cls_loss = nn.BCEWithLogitsLoss()
-        self.stitch_ce_loss = StitchLoss()
-        self.stitch_simi_loss = StitchSimpleLoss()
+        self.stitch_loss = StitchLoss()
     
     def forward(self, outputs, ground_truth, names=None, epoch=1000):
 
@@ -236,34 +224,23 @@ class SetCriterionWithOutMatcher(nn.Module):
                                   "st_adj_precs": st_adj_precs, 
                                   "st_adj_recls": st_adj_recls, 
                                   "st_adj_f1s": st_adj_f1s})
+            
+            # --- Simplified and Robust Loss Calculation ---
             edge_cls_gt = (~ground_truth["free_edges_mask"].view(b, -1)).float().to(outputs["edge_cls"].device)
             edge_cls_loss = torchvision.ops.sigmoid_focal_loss(outputs["edge_cls"].squeeze(-1), edge_cls_gt, reduction="mean")
             
-            if self.config["loss"]["stitches"] == "ce" and epoch != -1:
-                full_loss = full_loss * 10
-                loss_dict.update({"stitch_cls_loss": 0.5 * edge_cls_loss})
-                edge_cls_acc = ((F.sigmoid(outputs["edge_cls"].squeeze(-1)) > 0.5) == edge_cls_gt).sum().float() / (edge_cls_gt.shape[0] * edge_cls_gt.shape[1])
-                loss_dict.update({"stitch_edge_cls_acc": edge_cls_acc})
-                full_loss += loss_dict["stitch_cls_loss"]
-                # ce loss
-                stitch_loss, stitch_acc= self.stitch_ce_loss(outputs["edge_similarity"], ground_truth["label_indices"])
-                if stitch_loss is not None and stitch_acc is not None:
-                    loss_dict.update({"stitch_ce_loss": 0.01 * stitch_loss, "stitch_acc": stitch_acc})
-                    full_loss += loss_dict["stitch_ce_loss"]
-            elif self.config["loss"]["stitches"] == "simple" or epoch == -1:
-                full_loss = full_loss * 5
-                loss_dict.update({"stitch_cls_loss": 0.5 * edge_cls_loss})
-                edge_cls_acc = ((F.sigmoid(outputs["edge_cls"].squeeze(-1)) > 0.5) == edge_cls_gt).sum().float() / (edge_cls_gt.shape[0] * edge_cls_gt.shape[1])
-                loss_dict.update({"stitch_edge_cls_acc": edge_cls_acc})
-                full_loss += loss_dict["stitch_cls_loss"]
-                # simi loss
-                stitch_loss, stitch_acc = self.stitch_simi_loss(outputs["edge_similarity"], ground_truth["stitch_adj"], ground_truth["free_edges_mask"])
-                if stitch_loss is not None and stitch_acc is not None:
-                    loss_dict.update({"stitch_ce_loss": 0.05 * stitch_loss, "stitch_acc": stitch_acc})
-                    full_loss += loss_dict["stitch_ce_loss"]
-            else:
-                print("No Stitch Loss")
-                stitch_loss, stitch_acc = None, None 
+            full_loss = full_loss * 5
+            loss_dict.update({"stitch_cls_loss": 0.5 * edge_cls_loss})
+            edge_cls_acc = ((F.sigmoid(outputs["edge_cls"].squeeze(-1)) > 0.5) == edge_cls_gt).sum().float() / (edge_cls_gt.shape[0] * edge_cls_gt.shape[1])
+            loss_dict.update({"stitch_edge_cls_acc": edge_cls_acc})
+            full_loss += loss_dict["stitch_cls_loss"]
+            
+            # Unconditional call to the robust stitch loss
+            stitch_loss, stitch_acc = self.stitch_loss(outputs["edge_similarity"], ground_truth["stitch_adj"], ground_truth["free_edges_mask"])
+            
+            if stitch_loss is not None and stitch_acc is not None:
+                loss_dict.update({"stitch_loss": 0.05 * stitch_loss, "stitch_acc": stitch_acc})
+                full_loss += loss_dict["stitch_loss"]
 
             if "smpl_joints" in ground_truth and "smpl_joints" in outputs:
                 joints_loss = F.mse_loss(outputs["smpl_joints"], ground_truth["smpl_joints"])
@@ -273,77 +250,78 @@ class SetCriterionWithOutMatcher(nn.Module):
         return full_loss, loss_dict
     
     def prediction_stitch_rp(self, outputs, ground_truth):
-        # only support batchsize=1
+        if "edge_cls" not in outputs:
+            return [0], [0], [0], [0], [0], [0], [0], [0], [0]
 
-        if "edge_cls" in outputs:
-            bs, q = outputs["outlines"].shape[0], outputs["rotations"].shape[1]
-            st_edge_pres, st_edge_recls, st_edge_f1s, st_precs, st_recls, st_f1s, st_adj_precs, st_adj_recls, st_adj_f1s = [], [], [], [], [], [], [], [], []
+        bs = outputs["outlines"].shape[0]
+        st_edge_pres, st_edge_recls, st_edge_f1s, st_precs, st_recls, st_f1s, st_adj_precs, st_adj_recls, st_adj_f1s = [], [], [], [], [], [], [], [], []
+        
+        for b in range(bs):
+            edge_cls_gt = (~ground_truth["free_edges_mask"][b]).flatten()
+            edge_cls_pr = (F.sigmoid(outputs["edge_cls"][b].squeeze(-1)) > 0.5).flatten()
             
-            # import pdb; pdb.set_trace()
+            # Add zero_division=0 to prevent crash on empty predictions
+            cls_rept = classification_report(edge_cls_gt.detach().cpu().numpy(), edge_cls_pr.detach().cpu().numpy(), labels=[0,1], zero_division=0)
+            strs = cls_rept.split("\n")[3].split()
+            st_edge_precision, st_edge_recall, st_edge_f1_score = float(strs[1]), float(strs[2]), float(strs[3])
 
-            for b in range(bs):
-                edge_cls_gt = (~ground_truth["free_edges_mask"][b]).flatten()
-                edge_cls_pr = (F.sigmoid(outputs["edge_cls"][b].squeeze(-1)) > 0.5).flatten()
-                cls_rept = classification_report(edge_cls_gt.detach().cpu().numpy(), edge_cls_pr.detach().cpu().numpy(), labels=[0,1])
-                strs = cls_rept.split("\n")[3].split()
-                st_edge_precision, st_edge_recall, st_edge_f1_score = float(strs[1]), float(strs[2]), float(strs[3])
-                edge_similarity = outputs["edge_similarity"][b]
+            st_cls_pr = (F.sigmoid(outputs["edge_similarity"][b].squeeze(-1)) > 0.5).flatten()
+            stitch_cls_rept = classification_report(st_cls_pr.detach().cpu().numpy(), ground_truth["stitch_adj"][b].flatten().detach().cpu().numpy(), labels=[0, 1], zero_division=0)
+            strs = stitch_cls_rept.split("\n")[3].split()
+            st_adj_edge_precision, st_adj_edge_recall, st_adj_edge_f1_score = float(strs[1]), float(strs[2]), float(strs[3])
 
-                st_cls_pr = (F.sigmoid(outputs["edge_similarity"][b].squeeze(-1)) > 0.5).flatten()
-                stitch_cls_rept = classification_report(st_cls_pr.detach().cpu().numpy(), ground_truth["stitch_adj"][b].flatten().detach().cpu().numpy(), labels=[0, 1])
-                strs = stitch_cls_rept.split("\n")[3].split()
-                st_adj_edge_precision, st_adj_edge_recall, st_adj_edge_f1_score = float(strs[1]), float(strs[2]), float(strs[3])
+            st_adj_precs.append(st_adj_edge_precision)
+            st_adj_recls.append(st_adj_edge_recall)
+            st_adj_f1s.append(st_adj_edge_f1_score)
 
-                st_adj_precs.append(st_adj_edge_precision)
-                st_adj_recls.append(st_adj_edge_recall)
-                st_adj_f1s.append(st_adj_edge_f1_score)
+            edge_similarity = outputs["edge_similarity"][b]
+            simi_matrix = torch.triu(edge_similarity, diagonal=1)
+            stitches = []
+            num_stitches = edge_cls_pr.nonzero().shape[0] // 2
+            
+            for i in range(num_stitches):
+                if torch.max(simi_matrix) == -float("inf"):
+                    break
+                index = (simi_matrix == torch.max(simi_matrix)).nonzero()
+                stitches.append((index[0, 0].cpu().item(), index[0, 1].cpu().item()))
+                simi_matrix[index[0, 0], :] = -float("inf")
+                simi_matrix[index[0, 1], :] = -float("inf")
+                simi_matrix[:, index[0, 0]] = -float("inf")
+                simi_matrix[:, index[0, 1]] = -float("inf")
+            
+            st_precision, st_recall, st_f1_score = SetCriterionWithOutMatcher.set_precision_recall(stitches, ground_truth["stitches"][b])
 
-                if self.config["loss"]["stitches"] == "simple":
-                    simi_matrix = edge_similarity + edge_similarity.transpose(0, 1)
-                simi_matrix = torch.masked_fill(edge_similarity, (~edge_cls_pr).unsqueeze(0), -float("inf"))
-                simi_matrix = torch.masked_fill(simi_matrix, (~edge_cls_pr).unsqueeze(-1), 0)
-                simi_matrix = torch.triu(simi_matrix, diagonal=1)
-                stitches = []
-                num_stitches = edge_cls_pr.nonzero().shape[0] // 2
-                for i in range(num_stitches):
-                    index = (simi_matrix == torch.max(simi_matrix)).nonzero()
-                    stitches.append((index[0, 0].cpu().item(), index[0, 1].cpu().item()))
-                    simi_matrix[index[0, 0], :] = -float("inf")
-                    simi_matrix[index[0, 1], :] = -float("inf")
-                    simi_matrix[:, index[0, 0]] = -float("inf")
-                    simi_matrix[:, index[0, 1]] = -float("inf")
-                
-                st_precision, st_recall, st_f1_score = SetCriterionWithOutMatcher.set_precision_recall(stitches, ground_truth["stitches"][b])
+            st_edge_pres.append(st_edge_precision)
+            st_edge_recls.append(st_edge_recall)
+            st_edge_f1s.append(st_edge_f1_score)
+            st_precs.append(st_precision)
+            st_recls.append(st_recall)
+            st_f1s.append(st_f1_score)
 
-                st_edge_pres.append(st_edge_precision)
-                st_edge_recls.append(st_edge_recall)
-                st_edge_f1s.append(st_edge_f1_score)
-                st_precs.append(st_precision)
-                st_recls.append(st_recall)
-                st_f1s.append(st_f1_score)
-                # print(st_precision, st_recall, st_f1_score)
-
-            return st_edge_pres, st_edge_recls, st_edge_f1s, st_precs, st_recls, st_f1s, st_adj_precs, st_adj_recls, st_adj_f1s
+        return st_edge_pres, st_edge_recls, st_edge_f1s, st_precs, st_recls, st_f1s, st_adj_precs, st_adj_recls, st_adj_f1s
     
     @staticmethod
     def set_precision_recall(pred_stitches, gt_stitches):
-        
         def elem_eq(a, b):
             return (a[0] == b[0] and a[1] == b[1]) or (a[0] == b[1] and a[1] == b[0])
         
         gt_stitches = gt_stitches.transpose(0, 1).cpu().detach().numpy()
         true_pos = 0
-        false_pos = 0
-        false_neg = 0
+        
+        # Filter out padding in ground truth
+        valid_gt_stitches = [tuple(s) for s in gt_stitches if s[0] != -1 and s[1] != -1]
+        
         for pstitch in pred_stitches:
-            for gstitch in gt_stitches:
+            for gstitch in valid_gt_stitches:
                 if elem_eq(pstitch, gstitch):
                     true_pos += 1
+                    break # Move to next predicted stitch
+        
         false_pos = len(pred_stitches) - true_pos
-        false_neg = len(gt_stitches) - (gt_stitches == -1).sum() / 2  - true_pos
+        false_neg = len(valid_gt_stitches) - true_pos
 
         precision = true_pos / (true_pos + false_pos + 1e-6)
-        recall = true_pos / (true_pos + false_neg)
+        recall = true_pos / (true_pos + false_neg + 1e-6)
         f1_score = 2 * precision * recall / (precision + recall + 1e-6)
         return precision, recall, f1_score
     
@@ -363,24 +341,18 @@ class SetCriterionWithOutMatcher(nn.Module):
         if isinstance(self.composed_loss, object):
             self.composed_loss.eval()
             
-
 def build(args):
     num_classes = args["dataset"]["max_pattern_len"]
-    
-    # Handle device selection with proper CPU fallback
     try:
         if torch.cuda.is_available():
-            if isinstance(args["trainer"]["devices"], list) and len(args["trainer"]["devices"]) > 0:
-                devices = torch.device(f"cuda:{args['trainer']['devices'][0]}")
-            else:
-                devices = torch.device("cuda:0")
+            devices = torch.device(f"cuda:{args['trainer']['devices'][0]}")
         else:
             devices = torch.device("cpu")
-            print("No CUDA device available. Using CPU for model building.")
-    except Exception as e:
-        devices = torch.device("cpu")
-        print(f"Error setting up device, falling back to CPU: {e}")
-    
+    except (KeyError, IndexError):
+        devices = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    print(f"Building model on device: {devices}")
+
     backbone = build_backbone(args)
     panel_transformer = build_transformer(args)
 

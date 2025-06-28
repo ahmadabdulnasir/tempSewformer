@@ -6,3 +6,4 @@ Factory/sewformer_dataset
 Factory/sewformer_simimages
 .DS_Store
 data_configs/data_split.json
+data_configs/data_split.json

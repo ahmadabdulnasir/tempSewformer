@@ -84,7 +84,7 @@ NN:
       edge_loss_weight: 1. 
       rotation_loss_weight: 1. 
       translation_loss_weight: 1.
-    stitches: ce
+    stitches: simple
     lepoch: 0
     eos_coef: 0.1
     aux_loss: false
