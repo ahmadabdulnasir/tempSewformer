@@ -2,3 +2,5 @@
 __pycache__
 static
 outputs
+Factory/sewformer_dataset
+Factory/sewformer_simimages
