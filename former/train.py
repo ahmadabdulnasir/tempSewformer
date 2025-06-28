@@ -62,7 +62,7 @@ if __name__ == '__main__':
     experiment = ExperimentWrappper(
         config,  # set run id in cofig to resume unfinished run!
         system_info['wandb_username'],
-        no_sync=False) 
+        no_sync=True)  # Disable wandb synchronization
     
     # Dataset Class
     data_class = getattr(data, config['dataset']['class'])
