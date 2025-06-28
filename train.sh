@@ -47,5 +47,5 @@ EOL
 fi
 
 # Run the training script
-echo "Starting training..."
-torchrun --standalone --nnodes=1 --nproc_per_node=1 former/train.py -c former/configs/train.yaml
+echo "Starting training with 4 GPUs..."
+torchrun --standalone --nnodes=1 --nproc_per_node=4 former/train.py -c former/configs/train.yaml
