@@ -48,6 +48,9 @@ def get_values_from_args():
 if __name__ == '__main__':
     from pprint import pprint 
     np.set_printoptions(precision=4, suppress=True)
+    
+    # Get configuration from command line arguments
+    config, args = get_values_from_args()
     system_info = customconfig.Properties('./system.json')
 
     # DDP
