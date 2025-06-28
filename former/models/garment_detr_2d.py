@@ -149,39 +149,60 @@ class MLP(nn.Module):
 class StitchLoss(nn.Module):
     """
     Robust binary cross-entropy loss for stitch similarity matrix.
-    Handles shape mismatches between model output and ground truth.
+    Handles shape mismatches and prevents numerical instability by using a boolean mask.
     """
     def __call__(self, similarity_matrix, gt_matrix, gt_free_mask=None):
         num_queries = similarity_matrix.shape[1]
         
-        # Slice ground truth adjacency matrix to match query dimension
-        if gt_matrix.shape[1] > num_queries:
-            gt_matrix = gt_matrix[:, :num_queries, :num_queries]
+        # Ensure gt_matrix has the same dimensions as similarity_matrix
+        if gt_matrix.shape[1] != num_queries:
+            if gt_matrix.shape[1] > num_queries:
+                gt_matrix = gt_matrix[:, :num_queries, :num_queries]
+            else:
+                padding_size = num_queries - gt_matrix.shape[1]
+                gt_matrix = F.pad(gt_matrix, (0, padding_size, 0, padding_size), "constant", 0)
+
+        # Create a boolean mask to select valid elements for loss calculation
+        valid_mask = torch.ones_like(similarity_matrix, dtype=torch.bool)
 
         if gt_free_mask is not None:
-            # Ensure gt_free_mask is 2D (batch_size, num_edges)
             if gt_free_mask.dim() > 2:
                 gt_free_mask = gt_free_mask.reshape(gt_free_mask.shape[0], -1)
 
             batch_size, num_edges = gt_free_mask.shape
             
-            # Pad or slice the mask to match the number of queries
             if num_edges != num_queries:
                 if num_edges < num_queries:
-                    # Padded edges are considered "free", so pad with True
                     padding = torch.ones(batch_size, num_queries - num_edges, dtype=torch.bool, device=gt_free_mask.device)
                     gt_free_mask = torch.cat([gt_free_mask, padding], dim=1)
-                else: # num_edges > num_queries
+                else:
                     gt_free_mask = gt_free_mask[:, :num_queries]
 
-            # Apply mask to both rows and columns of the similarity matrix
-            similarity_matrix = torch.masked_fill(similarity_matrix, gt_free_mask.unsqueeze(1), -float("inf"))
-            similarity_matrix = torch.masked_fill(similarity_matrix, gt_free_mask.unsqueeze(2), -float("inf"))
+            # An element is invalid if its row or column corresponds to a free edge
+            invalid_row_mask = gt_free_mask.unsqueeze(2)  # (B, N, 1)
+            invalid_col_mask = gt_free_mask.unsqueeze(1)  # (B, 1, N)
+            invalid_mask = invalid_row_mask | invalid_col_mask
+            valid_mask &= ~invalid_mask
+
+        # Also mask out the diagonal
+        diag_mask = ~torch.eye(num_queries, device=similarity_matrix.device, dtype=torch.bool).unsqueeze(0)
+        valid_mask &= diag_mask
 
         gt_matrix = gt_matrix.float()
-        loss = F.binary_cross_entropy_with_logits(similarity_matrix, gt_matrix)
+
+        # Select only the valid elements for loss calculation
+        valid_preds = similarity_matrix[valid_mask]
+        valid_targets = gt_matrix[valid_mask]
         
-        accuracy = ((F.sigmoid(similarity_matrix) > 0.5) == gt_matrix).sum().float() / gt_matrix.numel()
+        # Handle case where there are no valid elements to prevent nan loss
+        if valid_targets.numel() == 0:
+            return torch.tensor(0.0, device=similarity_matrix.device, requires_grad=True), torch.tensor(1.0, device=similarity_matrix.device)
+
+        loss = F.binary_cross_entropy_with_logits(valid_preds, valid_targets)
+        
+        # Accuracy calculation on valid elements
+        accuracy = ((F.sigmoid(valid_preds) > 0.5) == (valid_targets > 0.5)).float().mean()
+        
         return loss, accuracy
 
 class SetCriterionWithOutMatcher(nn.Module):
