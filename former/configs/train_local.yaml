@@ -97,19 +97,20 @@ NN:
 trainer: 
   dry_run: False
   random_seed: 1
-  batch_size: 8  # Small batch size for local training
-  devices: [0]  # Use single GPU or CPU
+  batch_size: 4  # Very small batch size for CPU training
+  devices: []  # Empty list for CPU-only mode
   without_matcher: true
-  epochs: 20  # Reduced epochs for local testing
-  lr: 0.0002
-  lr_backbone: 1e-5
+  epochs: 10  # Further reduced epochs for CPU testing
+  lr: 0.0001  # Reduced learning rate for CPU
+  lr_backbone: 5e-6
   optimizer: AdamW
   weight_decay: 1e-4
   lr_scheduling: "warm_cosine"
-  lr_drop: 10
+  lr_drop: 5
   clip_max_norm: 0.1
   early_stopping:
     window: 0.0001
-    patience: 5  # Reduced patience for local training
+    patience: 3  # Further reduced patience for CPU training
   with_visualization: false  # Disable visualizations since we're not using wandb
   return_stitches: true
+  multiprocess: false  # Explicitly disable multiprocessing

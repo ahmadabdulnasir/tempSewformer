@@ -87,22 +87,24 @@ if __name__ == '__main__':
 
     # --- Model ---
     model, criterion = models.build_model(config)
-    model_without_ddp = model
-    
+    model_without_ddp = model  # Save reference to model without DDP wrapper
+
     if use_distributed:
-        # DDP setup for multi-GPU training
         torch.cuda.set_device(rank)
         model.cuda(rank)
         criterion.cuda(rank)
-        
-        # Wrap model for distributed training
+        device_str = f"cuda:{rank}"
         model = nn.parallel.DistributedDataParallel(model, device_ids=[rank], find_unused_parameters=True)
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-        
-        device_str = f"cuda:{rank}"
     else:
-        # Single GPU or CPU setup
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        # Handle CPU-only environments properly
+        if torch.cuda.is_available():
+            device = torch.device("cuda:0")
+            print("Using CUDA device for training")
+        else:
+            device = torch.device("cpu")
+            print("No CUDA device available. Using CPU for training (this will be slow)")
+            
         model.to(device)
         criterion.to(device)
         device_str = str(device)

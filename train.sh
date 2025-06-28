@@ -46,6 +46,9 @@ EOL
   echo "Created system.json with default values. Please update with your actual wandb username if needed."
 fi
 
+# Disable wandb syncing - we're running in offline mode
+export WANDB_MODE="dryrun"
+
 # Detect if we're running on a server with multiple GPUs or locally
 if [ -z "$LOCAL_TRAINING" ]; then
   # Check available GPUs
@@ -70,11 +73,17 @@ if [ -z "$LOCAL_TRAINING" ]; then
   else
     # Local mode (Mac or single/no GPU)
     echo "Starting training in local mode..."
+    # For Mac/CPU environments, set worker count lower to avoid warnings
+    export OMP_NUM_THREADS=4
+    export MKL_NUM_THREADS=4
     # Use Python directly without distributed training
     python former/train.py -c former/configs/train_local.yaml
   fi
 else
   # Explicitly requested local training
   echo "Starting training in local mode (explicitly requested)..."
+  # For Mac/CPU environments, set worker count lower to avoid warnings
+  export OMP_NUM_THREADS=4
+  export MKL_NUM_THREADS=4
   python former/train.py -c former/configs/train_local.yaml
 fi
