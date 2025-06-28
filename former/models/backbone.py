@@ -93,9 +93,17 @@ class Backbone(BackboneBase):
         #     replace_stride_with_dilation=[False, False, dilation],
         #     pretrained=is_main_process(), norm_layer=FrozenBatchNorm2d)
         # for dummy running
-        backbone = getattr(torchvision.models, name)(
-            replace_stride_with_dilation=[False, False, dilation],
-            pretrained=False, norm_layer=FrozenBatchNorm2d)
+        # BasicBlock in resnet18/34 doesn't support dilation > 1
+        if name in ('resnet18', 'resnet34'):
+            # For resnet18 and resnet34, we can't use dilation
+            backbone = getattr(torchvision.models, name)(
+                replace_stride_with_dilation=[False, False, False],
+                pretrained=False, norm_layer=FrozenBatchNorm2d)
+        else:
+            # For resnet50 and above, we can use dilation
+            backbone = getattr(torchvision.models, name)(
+                replace_stride_with_dilation=[False, False, dilation],
+                pretrained=False, norm_layer=FrozenBatchNorm2d)
         if in_channel != 3:
             layer = backbone.conv1
             new_layer = nn.Conv2d(in_channel, 

@@ -114,3 +114,4 @@ trainer:
   with_visualization: false  # Disable visualizations since we're not using wandb
   return_stitches: true
   multiprocess: false  # Explicitly disable multiprocessing
+  num_workers: 4  # Limit number of DataLoader workers for CPU training

@@ -130,8 +130,17 @@ class ExperimentWrappper(object):
         """Id of the last epoch processed
             NOTE: only for experiments running\loaded from wandb
         """
-        run = self._run_object()
-        return run.summary['best_valid_loss'] if 'best_valid_loss' in run.summary else None
+        # For offline mode, return None to avoid API calls
+        if self.no_sync or os.environ.get('WANDB_MODE') == 'dryrun':
+            print('ExperimentWrappper::WARNING::Running in offline mode, no best validation loss available')
+            return None
+            
+        try:
+            run = self._run_object()
+            return run.summary['best_valid_loss'] if 'best_valid_loss' in run.summary else None
+        except Exception as e:
+            print(f'ExperimentWrappper::WARNING::Error accessing wandb API: {str(e)}')
+            return None
 
     def NN_config(self):
         """Run configuration params of NeuralNetwork model"""
@@ -429,6 +438,9 @@ class ExperimentWrappper(object):
     def _run_object(self):
         """ Shortcut for getting reference to wandb api run object. 
             To uniformly access both ongoing & finished runs"""
+        # Don't try to access the API in offline mode
+        if self.no_sync or os.environ.get('WANDB_MODE') == 'dryrun':
+            raise ValueError("Cannot access wandb API in offline mode")
         return wb.Api().run(self.cloud_path())
     
     def _run_config(self):

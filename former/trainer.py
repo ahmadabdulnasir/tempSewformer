@@ -178,8 +178,13 @@ class Trainer():
             start_epoch = 0
             # record configurations of data and model
             self.datawraper.save_to_wandb(self.experiment)
-            if hasattr(model.module, 'config'):
+            # Check if model is wrapped in DDP (has .module attribute)
+            if hasattr(model, 'module') and hasattr(model.module, 'config'):
                 self.experiment.add_config('NN', model.module.config)  # save NN configuration
+            # Check if base model has config
+            elif hasattr(model, 'config'):
+                self.experiment.add_config('NN', model.config)  # save NN configuration
+            # Fallback to config parameter
             elif config is not None:
                 self.experiment.add_config('NN', config["NN"])
 
@@ -417,9 +422,20 @@ class TrainerDetr(Trainer):
         log_step = wb.run.step - 1
         return_stitches = self.setup["return_stitches"]
 
+        # Initialize best validation loss
+        best_valid_loss = None
         if (self.setup["multiprocess"] and self.device == 0) or not self.setup["multiprocess"]:
-            best_valid_loss = self.experiment.last_best_validation_loss()
-            best_valid_loss = torch.tensor(best_valid_loss) if best_valid_loss is not None else None
+            try:
+                best_valid_loss = self.experiment.last_best_validation_loss()
+                best_valid_loss = torch.tensor(best_valid_loss) if best_valid_loss is not None else None
+            except Exception as e:
+                print(f"TrainerDetr::WARNING::Error getting best validation loss: {str(e)}")
+                best_valid_loss = None
+                
+        # If we're in offline mode or couldn't get the best validation loss, start with a high value
+        if best_valid_loss is None:
+            print("TrainerDetr::INFO::No previous best validation loss found, starting fresh")
+            best_valid_loss = torch.tensor(float('inf'))
         iter_items = 0
         for epoch in range(start_epoch, wb.config.trainer["epochs"]):
             model.train()
