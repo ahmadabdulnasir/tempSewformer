@@ -121,45 +121,27 @@ class GarmentDETRv6(nn.Module):
             stitch_edges = torch.argsort(pred_edge_prob, dim=1)[:, :num_edges]
             # use_gt = random.random() < self.edge_kwargs["gt_prob"] if "gt_prob" in self.edge_kwargs else False
             
-            # Debug print to understand tensor shapes
-            print(f"DEBUG: stitch_edges shape: {stitch_edges.shape}, output_edge_embed shape: {output_edge_embed.shape}")
-            
             if gt_stitches is not None:
                 stitch_edges = gt_stitches
-                print(f"DEBUG: gt_stitches shape: {gt_stitches.shape}")
             
-            # Handle tensor dimensions properly
-            # Ensure stitch_edges is 2D (batch_size x num_edges)
-            while len(stitch_edges.shape) > 2:
+            # Squeeze trailing dimensions of size 1 to make tensor shape consistent
+            while stitch_edges.dim() > 2 and stitch_edges.shape[-1] == 1:
                 stitch_edges = stitch_edges.squeeze(-1)
+
+            # unsqueeze to add feature dimension for broadcasting and expand
+            indices_for_gather = stitch_edges.unsqueeze(-1)
+            # Create the target shape for expansion
+            expand_dims = list(indices_for_gather.shape)
+            expand_dims[-1] = output_edge_embed.shape[-1]
+            gather_indices = indices_for_gather.expand(*expand_dims).long()
             
-            print(f"DEBUG: After squeeze, stitch_edges shape: {stitch_edges.shape}")
+            edge_node_features = torch.gather(output_edge_embed, 1, gather_indices)
+
+            if gt_stitches is not None and gt_edge_mask is not None:
+                mask_expanded = gt_edge_mask.unsqueeze(-1).expand_as(edge_node_features)
+                edge_node_features = edge_node_features.masked_fill(mask_expanded == 0, 0)
             
-            # Now create gather indices and perform gather operation
-            try:
-                # Create indices for gather operation
-                gather_indices = stitch_edges.unsqueeze(-1).expand(-1, -1, output_edge_embed.shape[-1]).long()
-                print(f"DEBUG: gather_indices shape: {gather_indices.shape}")
-                
-                # Gather features
-                edge_node_features = torch.gather(output_edge_embed, 1, gather_indices)
-                
-                # Apply masking if gt_stitches is provided
-                if gt_stitches is not None and gt_edge_mask is not None:
-                    # Ensure mask has the right dimensions
-                    while len(gt_edge_mask.shape) > 2:
-                        gt_edge_mask = gt_edge_mask.squeeze(-1)
-                    
-                    mask_expanded = gt_edge_mask.unsqueeze(-1).expand(-1, -1, output_edge_embed.shape[-1])
-                    edge_node_features = edge_node_features.masked_fill(mask_expanded == 0, 0)
-                
-                reindex_stitches = None
-            except Exception as e:
-                print(f"ERROR in tensor operations: {str(e)}")
-                # Fallback: use the output_edge_embed directly
-                print("Falling back to using output_edge_embed directly")
-                edge_node_features = output_edge_embed
-                reindex_stitches = None
+            reindex_stitches = None
         else:
             edge_node_features = output_edge_embed
         

@@ -101,7 +101,7 @@ NN:
 trainer: 
   dry_run: False
   random_seed: 1
-  batch_size: 128  # Increased batch size for 4 GPUs
+  batch_size: 32  # Reduced batch size for 4 GPUs to prevent OOM
   devices: [0, 1, 2, 3]  # Using all 4 A100 GPUs
   without_matcher: true
   epochs: 350
