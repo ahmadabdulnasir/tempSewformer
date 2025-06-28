@@ -14,7 +14,7 @@ if sys.version_info.major >= 3:  # prevent from loading within Maya -- Py2.7 com
     import platform
     import json
     import psutil
-    if 'win' in platform.system() or 'Win' in platform.system():
+    if ('win' in platform.system() or 'Win' in platform.system()) and platform.system() !="Darwin":
         import wmi  # pip install wmi
 
 

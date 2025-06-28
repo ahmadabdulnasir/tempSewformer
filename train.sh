@@ -46,6 +46,35 @@ EOL
   echo "Created system.json with default values. Please update with your actual wandb username if needed."
 fi
 
-# Run the training script
-echo "Starting training with 4 GPUs..."
-torchrun --standalone --nnodes=1 --nproc_per_node=4 former/train.py -c former/configs/train.yaml
+# Detect if we're running on a server with multiple GPUs or locally
+if [ -z "$LOCAL_TRAINING" ]; then
+  # Check available GPUs
+  if command -v nvidia-smi &> /dev/null; then
+    GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+  else
+    GPU_COUNT=0
+  fi
+
+  # Determine if we're on a Mac
+  if [[ "$(uname)" == "Darwin" ]]; then
+    IS_MAC=1
+  else
+    IS_MAC=0
+  fi
+
+  # Set training mode based on environment
+  if [ $GPU_COUNT -gt 1 ] && [ $IS_MAC -eq 0 ]; then
+    # Server mode with multiple GPUs
+    echo "Starting training with $GPU_COUNT GPUs..."
+    torchrun --standalone --nnodes=1 --nproc_per_node=$GPU_COUNT former/train.py -c former/configs/train.yaml
+  else
+    # Local mode (Mac or single/no GPU)
+    echo "Starting training in local mode..."
+    # Use Python directly without distributed training
+    python former/train.py -c former/configs/train_local.yaml
+  fi
+else
+  # Explicitly requested local training
+  echo "Starting training in local mode (explicitly requested)..."
+  python former/train.py -c former/configs/train_local.yaml
+fi

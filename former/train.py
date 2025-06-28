@@ -52,13 +52,24 @@ if __name__ == '__main__':
     # Get configuration from command line arguments
     config, args = get_values_from_args()
     system_info = customconfig.Properties('./system.json')
-
-    # DDP
-    dist.init_process_group(backend='nccl')
-    rank = dist.get_rank()
-    print(f"INFO::{__file__}::Start running basic DDP example on rank {rank}.")
-    config['trainer']['multiprocess'] = True
-
+    
+    # Check if we should use distributed training
+    use_distributed = True
+    try:
+        # Try to initialize distributed training
+        dist.init_process_group(backend='nccl')
+        rank = dist.get_rank()
+        print(f"INFO::{__file__}::Running in distributed mode on rank {rank}.")
+        config['trainer']['multiprocess'] = True
+        # Set device to current rank
+        torch.cuda.set_device(rank)
+    except Exception as e:
+        # Fall back to non-distributed mode
+        print(f"INFO::{__file__}::Running in non-distributed mode. Reason: {e}")
+        use_distributed = False
+        rank = 0
+        config['trainer']['multiprocess'] = False
+    
     experiment = ExperimentWrappper(
         config,  # set run id in cofig to resume unfinished run!
         system_info['wandb_username'],
@@ -68,26 +79,42 @@ if __name__ == '__main__':
     data_class = getattr(data, config['dataset']['class'])
     dataset = data_class(system_info['datasets_path'], system_info["sim_root"], config['dataset'], gt_caching=True, feature_caching=False)
 
+    # Disable visualization since we're not using wandb
     trainer = TrainerDetr(
             config['trainer'], experiment, dataset, config['data_split'], 
-            with_norm=True, with_visualization=config['trainer']['with_visualization'])  # only turn on visuals on custom garment data
+            with_norm=True, with_visualization=False)  # Disable visualization to avoid wandb directory issues
     trainer.init_randomizer()
 
     # --- Model ---
     model, criterion = models.build_model(config)
     model_without_ddp = model
-    # DDP
-    torch.cuda.set_device(rank)
-    model.cuda(rank)
-    criterion.cuda(rank)
-
-    # Wrap model
-    model = nn.parallel.DistributedDataParallel(model, device_ids=[rank], find_unused_parameters=True)
-    model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-
+    
+    if use_distributed:
+        # DDP setup for multi-GPU training
+        torch.cuda.set_device(rank)
+        model.cuda(rank)
+        criterion.cuda(rank)
+        
+        # Wrap model for distributed training
+        model = nn.parallel.DistributedDataParallel(model, device_ids=[rank], find_unused_parameters=True)
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        
+        device_str = f"cuda:{rank}"
+    else:
+        # Single GPU or CPU setup
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        model.to(device)
+        criterion.to(device)
+        device_str = str(device)
+        
+    print(f"Train::Info::Using device: {device_str}")
+    
+    # Load pre-trained model if available
     if config["NN"]["step-trained"] is not None and os.path.exists(config["NN"]["step-trained"]):
-        model.load_state_dict(torch.load(config["NN"]["step-trained"], map_location="cuda:{}".format(rank))["model_state_dict"])
-        print("Train::Info::Load Pre-step-trained model: {}".format(config["NN"]["step-trained"]))
+        state_dict = torch.load(config["NN"]["step-trained"], map_location=device_str)["model_state_dict"]
+        model.load_state_dict(state_dict)
+        print(f"Train::Info::Load Pre-step-trained model: {config['NN']['step-trained']}")
+
     
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f'Train::Info::Number of params: {n_parameters}')
@@ -101,13 +128,24 @@ if __name__ == '__main__':
             raise ValueError("Pre-trained model should be set for test")
 
     # --- Final evaluation ----
-    if rank == 0:
-        model.load_state_dict(experiment.get_best_model()['model_state_dict'])
-        datawrapper = trainer.datawraper
-        final_metrics = eval_detr_metrics(model, criterion, datawrapper, rank, 'validation')
-        experiment.add_statistic('valid_on_best', final_metrics, log='Validation metrics')
-        pprint(final_metrics)
-        final_metrics = eval_detr_metrics(model, criterion, datawrapper, rank, 'test')
-        experiment.add_statistic('test_on_best', final_metrics, log='Test metrics')
-        pprint(final_metrics)
+    # Only run final evaluation on rank 0 in distributed mode, or always in non-distributed mode
+    if not use_distributed or rank == 0:
+        try:
+            print("Train::Info::Running final evaluation on best model")
+            model.load_state_dict(experiment.get_best_model()['model_state_dict'])
+            datawrapper = trainer.datawraper
+            
+            final_metrics = eval_detr_metrics(model, criterion, datawrapper, rank, 'validation')
+            experiment.add_statistic('valid_on_best', final_metrics, log='Validation metrics')
+            pprint(final_metrics)
+            
+            final_metrics = eval_detr_metrics(model, criterion, datawrapper, rank, 'test')
+            experiment.add_statistic('test_on_best', final_metrics, log='Test metrics')
+            pprint(final_metrics)
+        except Exception as e:
+            print(f"Train::Warning::Final evaluation failed: {e}")
+            
+    # Clean up distributed process group if used
+    if use_distributed:
+        dist.destroy_process_group()
         

@@ -1,16 +1,15 @@
-# Training configuration for Pattern Shape prediction model 
+# Training configuration for Pattern Shape prediction model - LOCAL VERSION
 # (part I of NeuralTailor)
-
-# 0.5 * stitch cls loss (focal loss) + 0.005 * stitch ce loss + 5 * panel loss
+# Optimized for local training on Mac or single GPU systems
 
 experiment:
   project_name: FashableTechpack
-  run_name: Training
+  run_name: LocalTraining
   run_id: 
   local_dir: outputs/checkpoints
   is_training: True
-  save_checkpoint_steps: 100  # Save a checkpoint every 100 steps
-  save_checkpoint_epochs: 0   # Save a checkpoint every epoch (default behavior)
+  save_checkpoint_steps: 10  # Save checkpoints more frequently for local testing
+  save_checkpoint_epochs: 1  # Save a checkpoint every epoch
 
 # ----- Dataset-related properties -----
 dataset: 
@@ -27,13 +26,12 @@ dataset:
   translation_size: 3
   use_sim: true
   use_smpl_loss: true
-  img_size: 1024
+  img_size: 512  # Reduced image size for local training
   augment: true
 
   panel_classification: ./data_configs/panel_classes_condenced.json 
   filter_by_params: ./data_configs/param_filter.json
     
-
   standardize:
     gt_scale:
       outlines: [26.674109  , 29.560705,  1,  1]
@@ -49,12 +47,10 @@ dataset:
 data_split:
   type: percent
   split_on: folder
-  valid_per_type: 5
-  test_per_type: 90
-
+  valid_per_type: 10
+  test_per_type: 80  # Use more data for training in local mode
 
 # ----- Network Architecture --------
-
 NN:
   pre-trained:  
   step-trained: 
@@ -63,60 +59,57 @@ NN:
   frozen_weights: 
   masks: 
   max_num_edges: 56
-  backbone: resnet50
+  backbone: resnet18  # Lighter backbone for local training
   in_channel: 3
   dilation: True
   position_embedding: sine
 
-  # Transformer
-  enc_layers: 6 
-  dec_layers: 6
-  dim_feedforward: 2048
-  hidden_dim: 256 
+  # Transformer - reduced size for local training
+  enc_layers: 3
+  dec_layers: 3
+  dim_feedforward: 1024
+  hidden_dim: 128
   dropout: 0.1
-  nheads: 8 
+  nheads: 4
   num_queries: 25
   pre_norm: True
   aux_loss: true 
 
   # ----- Losses ----
   loss:
-    loss_components:  [shape, loop, rotation, translation]  #  stitch, free_class, segmentation
-    quality_components:  [shape, discrete, rotation, translation]  # stitch, free_class
+    loss_components:  [shape, loop, rotation, translation]
+    quality_components:  [shape, discrete, rotation, translation]
     loss_weight_dict:
       loop_loss_weight: 1.
       edge_loss_weight: 1. 
       rotation_loss_weight: 1. 
       translation_loss_weight: 1.
-    stitches: ce                  # ce, simple
+    stitches: ce
     lepoch: 0
     eos_coef: 0.1
     aux_loss: false
     panel_origin_invariant_loss: False
-    panel_order_inariant_loss: False  # False to use ordering as in the data_config
+    panel_order_inariant_loss: False
     epoch_with_order_matching: 0
-    order_by: shape_translation   # placement, translation, stitches, shape_translation
+    order_by: shape_translation
 
 # ------- Trainer -----
 trainer: 
   dry_run: False
   random_seed: 1
-  batch_size: 128  # Increased batch size for 4 GPUs
-  devices: [0, 1, 2, 3]  # Using all 4 A100 GPUs
+  batch_size: 8  # Small batch size for local training
+  devices: [0]  # Use single GPU or CPU
   without_matcher: true
-  epochs: 350
+  epochs: 20  # Reduced epochs for local testing
   lr: 0.0002
   lr_backbone: 1e-5
   optimizer: AdamW
   weight_decay: 1e-4
   lr_scheduling: "warm_cosine"
-  lr_drop: 200
+  lr_drop: 10
   clip_max_norm: 0.1
   early_stopping:
     window: 0.0001
-    patience: 50
+    patience: 5  # Reduced patience for local training
   with_visualization: false  # Disable visualizations since we're not using wandb
   return_stitches: true
-
-
-
