@@ -68,11 +68,16 @@ if [ -z "$LOCAL_TRAINING" ]; then
   # Set training mode based on environment
   if [ $GPU_COUNT -gt 1 ] && [ $IS_MAC -eq 0 ]; then
     # Server mode with multiple GPUs
-    echo "Starting training with $GPU_COUNT GPUs..."
+    echo "Starting training with $GPU_COUNT GPUs using distributed mode..."
     torchrun --standalone --nnodes=1 --nproc_per_node=$GPU_COUNT former/train.py -c former/configs/train.yaml
+  elif [ $GPU_COUNT -eq 1 ] && [ $IS_MAC -eq 0 ]; then
+    # Server mode with single GPU
+    echo "Starting training with single GPU..."
+    # Use Python directly without distributed training but with GPU config
+    CUDA_VISIBLE_DEVICES=0 python former/train.py -c former/configs/train.yaml
   else
-    # Local mode (Mac or single/no GPU)
-    echo "Starting training in local mode..."
+    # Local mode (Mac or no GPU)
+    echo "Starting training in local mode (CPU only)..."
     # For Mac/CPU environments, set worker count lower to avoid warnings
     export OMP_NUM_THREADS=4
     export MKL_NUM_THREADS=4
