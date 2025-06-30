@@ -131,7 +131,7 @@ class RealisticDatasetDetrWrapper(object):
             else:
                 print("No Multiprocess")
                 self.loaders.train = DataLoader(self.training, self.batch_size, 
-                                                #collate_fn=collate_fn, 
+                                                collate_fn=collate_fn, 
                                                 num_workers=12, 
                                                 pin_memory=True,
                                                 shuffle=shuffle_train)
