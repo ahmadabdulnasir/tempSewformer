@@ -113,10 +113,16 @@ class GarmentDETRv6(nn.Module):
             # Ensure gather indices are within the bounds of output_edge_embed
             max_index = output_edge_embed.shape[1]
             gt_stitches = gt_stitches.clamp(max=max_index - 1)
-
+            
+            # Make sure tensors are on the same device
+            device = output_edge_embed.device
+            gt_stitches = gt_stitches.to(device)
+            
             gather_indices = gt_stitches.unsqueeze(-1).expand(-1, -1, output_edge_embed.shape[-1])
             edge_node_features = torch.gather(output_edge_embed, 1, gather_indices.long())
             
+            # Make sure gt_edge_mask is on the same device
+            gt_edge_mask = gt_edge_mask.to(device)
             mask_for_fill = gt_edge_mask.unsqueeze(-1).expand_as(edge_node_features) == 0
             edge_node_features = edge_node_features.masked_fill(mask_for_fill, 0)
         else:
