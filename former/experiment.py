@@ -428,12 +428,25 @@ class ExperimentWrappper(object):
         """Download a requested artifact withing current project. Return loaded path"""
         print('Experiment::Requesting artifacts: {}'.format(artifact_name))
 
-        api = wb.Api({'project': self.project})
-        artifact = api.artifact(name=artifact_name)
-        filepath = artifact.download(str(to_path) if to_path else None)
-        print('Experiment::Artifact saved to: {}'.format(filepath))
+        # In offline mode (no_sync), artifacts are not uploaded but saved locally.
+        # Return the path to the local directory, the caller will find the latest file.
+        if self.no_sync:
+            local_path = self.local_artifact_path()
+            print(f'Experiment::Offline mode: loading from local artifact path: {local_path}')
+            if not local_path.exists() or not any(local_path.iterdir()):
+                print(f'Experiment::Warning::Offline mode: local artifact path is empty or does not exist.')
+                return None
+            return local_path
 
-        return Path(filepath)
+        try:
+            api = wb.Api({'project': self.project})
+            artifact = api.artifact(name=artifact_name)
+            filepath = artifact.download(str(to_path) if to_path else None)
+            print('Experiment::Artifact saved to: {}'.format(filepath))
+            return Path(filepath)
+        except (wb.errors.CommError, ValueError) as e:
+            print(f'Experiment::Warning::Could not download artifact {artifact_name}. Reason: {e}')
+            return None
 
     def _run_object(self):
         """ Shortcut for getting reference to wandb api run object. 
@@ -470,8 +483,9 @@ class ExperimentWrappper(object):
 
     def _load_model_from_file(self, file, device=None):
         print(file)
+        # weights_only=False is required for PyTorch 2.6+ to load checkpoints with optimizer states
         if device is not None:
-            return torch.load(file, map_location=device)
+            return torch.load(file, map_location=device, weights_only=False)
         else: 
-            return torch.load(file)  # to the same device it was saved from
+            return torch.load(file, weights_only=False)  # to the same device it was saved from
 
